@@ -37,9 +37,10 @@
 #include "hi_time.h"
 #include "hi_i2c.h"
 #include "max30102.h"
+#include "./max30102/algorithm.h"
 
 #define CONFIG_WIFI_SSID "yuizhu" // 修改为自己的WiFi 热点账号
-#define CONFIG_WIFI_PWD "zhangran2004" // 修改为自己的WiFi 热点密码
+#define CONFIG_WIFI_PWD "20040906" // 修改为自己的WiFi 热点密码
 #define CONFIG_APP_SERVERIP "117.78.5.125"  //这是华为云平台标准版的IP地址
 #define CONFIG_APP_SERVERPORT "1883"        //这是华为云开放MQTT端口，开放的还有8883端口
 #define CONFIG_APP_DEVICEID "6553a1e616c4bf776318127e_20231115" // 替换为注册设备后生成的deviceid
@@ -133,8 +134,8 @@ typedef struct {
 
 //这里定义max30102消息上报的结构体
 typedef struct {
-    unsigned int red;
-    unsigned int ir;
+    int red;
+    int ir;
 }report_max30102_t;
 
 //这里是定义消息打包的ID
@@ -160,13 +161,29 @@ typedef struct {
     int flag_timer_2;     //判断心率检测时间是否到达
 } app_cb_t;
 
-
 static app_cb_t g_app_cb;
 int g_coverStatus = 1;
 int state = 0;
 uint32_t *pun_red_led;  //max30102红光数据的指针参数
 uint32_t *pun_ir_led;   //max30102红外光数据的指针参数
+
+uint32_t aun_ir_buffer[500]; //IR LED sensor data   红外数据，用于计算血氧
+int32_t n_ir_buffer_length=500;    //data length  
+uint32_t aun_red_buffer[500];    //Red LED sensor data  红光数据，用于计算心率曲线以及计算心率
+
+int32_t n_sp02; //SPO2 value
+int8_t ch_spo2_valid;   //indicator to show if the SP02 calculation is valid
+int32_t n_heart_rate;   //heart rate value
+int8_t  ch_hr_valid;    //indicator to show if the heart rate calculation is valid
+#define MAX_BRIGHTNESS 255
+
 osTimerId_t ID1,ID2;  //定时器的ID
+
+// 定时器的参数
+osTimerId_t id1, id2, id3, id4;
+uint32_t timerDelay;
+osStatus_t status_1, status_2, status_3, status_4;
+uint32_t exec1, exec2, exec3, exec4;
 
 int ACCEL_x[100],ACCEL_y[100],ACCEL_z[100],GYRO_x[100],GYRO_y[100],GYRO_z[100];  //定义mpu6050参数数组，作为运动数据的缓存区
 unsigned int RED[1000],IR[1000];    //定义max30102参数数组，作为运动数据的缓存区
@@ -183,6 +200,12 @@ void Timer2_Callback(void *arg)
 {
     (void)arg;
     g_app_cb.flag_timer_2 = 1;
+}
+
+void VCC(void)
+{
+    IoTGpioSetOutputVal(7,1);
+    IoTGpioSetOutputVal(8,1);
 }
 
 /*
@@ -464,7 +487,6 @@ static void deal_cmd_msg(cmd_t *cmd)
     } else if (strcmp(cJSON_GetStringValue(obj_cmdname), "Max30102_Begin") == 0) {  //对应华为云IoTDA的产品——>模型的命令名称
         deal_max30102_cmd(cmd, obj_root);
     }
-
     return;
 } 
 
@@ -561,8 +583,18 @@ float map(float val, float I_Min, float I_Max, float O_Min, float O_Max)
     参数：空
     作用：初始化max30102传感器
 */
-static void heartrateTask_Init()
+static void *heartrateTask_Init(const char *arg)
 {
+    //max30102变量
+	uint32_t un_min, un_max, un_prev_data;  
+	int i,j;
+	int32_t n_brightness;
+	float f_temp;
+	uint8_t temp[6];
+
+    //500个中断一次
+    int number_500 = 0;
+
     IoTGpioInit(MAX_SDA_IO13);
 	IoTGpioInit(MAX_SCL_IO14);
     hi_io_set_func(MAX_SDA_IO13, HI_IO_FUNC_GPIO_13_I2C0_SDA);
@@ -571,16 +603,68 @@ static void heartrateTask_Init()
 	IoTGpioInit(9);
     IoTGpioSetDir(9,IOT_GPIO_DIR_OUT);
     max30102_init();
+    while(1)
+    {
+        maxim_max30102_read_fifo(&pun_red_led, &pun_ir_led);
+        // printf("--------------------------\r\n");
+        // printf("red:%d\r\n",pun_red_led);
+        aun_red_buffer[number_500] = pun_red_led;
+        // printf("ir:%d\r\n",pun_ir_led);
+        aun_ir_buffer[number_500] = pun_ir_led;
+        // printf("--------------------------");
+        number_500 ++;
+        osDelay(10U);
+
+        un_min=0x3FFFF;
+	    un_max=0;
+        n_ir_buffer_length=200; //缓冲区长度100存储5秒的运行在100sps的样本
+	    //读取前500个样本，确定信号范围
+        if (number_500 % 200 == 0)
+        {
+            for(i=0;i<n_ir_buffer_length;i++)
+            {
+                // aun_red_buffer[i] =  pun_red_led;  //  将值合并得到实际数字
+                // aun_ir_buffer[i] =   pun_ir_led; //  将值合并得到实际数字
+                if(un_min>aun_red_buffer[i])
+                        un_min=aun_red_buffer[i];//更新计算最小值
+                if(un_max<aun_red_buffer[i])
+                        un_max=aun_red_buffer[i];//更新计算最大值
+            }
+            
+            //在计算心率前取100组样本，取的数据放在400-500缓存数组中
+            for(i=100;i<200;i++){
+                un_prev_data=aun_red_buffer[i-1];//临时记录上一次读取数据
+                if(aun_red_buffer[i]>un_prev_data){//用新获取的一个数值与上一个数值对比
+                    f_temp=aun_red_buffer[i]-un_prev_data;
+                    f_temp /=(un_max-un_min);
+                    f_temp*=MAX_BRIGHTNESS;//公式（心率曲线）=（新数值-旧数值）/（最大值-最小值）*255
+                    n_brightness-=(int)f_temp;
+                    if(n_brightness<0)
+                        n_brightness=0;
+                }
+                else{
+                    f_temp=un_prev_data-aun_red_buffer[i];
+                    f_temp/=(un_max-un_min);
+                    f_temp*=MAX_BRIGHTNESS;//公式（心率曲线）=（旧数值-新数值）/（最大值-最小值）*255
+                    n_brightness+=(int)f_temp;
+                    if(n_brightness>MAX_BRIGHTNESS)
+                        n_brightness=MAX_BRIGHTNESS;
+                }
+						
+            //un_prev_data=aun_red_buffer[i];
+            //获取数据最后一个数值，没有用，主程序中未马上使用被替换
+            //计算前500个样本(前5秒样本)后的心率和SpO2
+            maxim_heart_rate_and_oxygen_saturation(aun_ir_buffer, n_ir_buffer_length, aun_red_buffer, &n_sp02, &ch_spo2_valid, &n_heart_rate, &ch_hr_valid); 
+            }
+            printf("%d\n",n_heart_rate);
+            printf("%d\n",(int)n_sp02);
+            number_500 = 0;
+        }
+    }
 }
 
 static int SensorTaskEntry(void)
 {
-    // 定时器
-    osTimerId_t id1, id2, id3, id4;
-    uint32_t timerDelay;
-    osStatus_t status_1, status_2, status_3, status_4;
-    uint32_t exec1, exec2, exec3, exec4;
-
     app_msg_t *app_msg;
     uint8_t ret;
     E53SC2Data data;
@@ -707,63 +791,38 @@ static int SensorTaskEntry(void)
 
 static int Max30102TaskEntry(void)
 {
-    // 定时器的参数
-    osTimerId_t id1, id2, id3, id4;
-    uint32_t timerDelay;
-    osStatus_t status_1, status_2, status_3, status_4;
-    uint32_t exec1, exec2, exec3, exec4;
+    
 
     app_msg_t *app_msg;
     uint8_t ret;
     E53SC2Data data;
 
-    // 定时器1：用于读取max30102的数据
-    exec1 = 3U;
-    id1 = osTimerNew(Timer2_Callback, osTimerOnce, &exec1, NULL);
-
-
     while (1) {
+        int i,j;
 
         if (g_app_cb.max30102_state == 1)
         {
-            heartrateTask_Init();
-            int i=0,j=0;
-            timerDelay = 500U;
-            status_1 = osTimerStart(id1, timerDelay); // 定时器开始
+
             while (1)
             {
-                maxim_max30102_read_fifo(&pun_red_led, &pun_ir_led);
-                osDelay(50U);
-
-                RED[i]=pun_red_led;
-                printf("\r\n**************RED         is  %lf\r\n", pun_red_led);
-                IR[i]=pun_ir_led;
-                printf("\r\n**************IR         is  %lf\r\n", pun_ir_led);
-                i=i+1;
-
-                if (g_app_cb.flag_timer_2 == 1)
-                {
                     app_msg = malloc(sizeof(app_msg_t));
                     if (app_msg != NULL) {
-                        for (j=0; j<i; j++)
-                        {
+                            printf("wwww");
                             app_msg->msg_type = en_msg_max30102_report;
-                            app_msg->msg.report_max30102.red = RED[j];
-                            app_msg->msg.report_max30102.ir = IR[j];
+                            app_msg->msg.report_max30102.red = (int)n_heart_rate;
+                            app_msg->msg.report_max30102.ir = (int)n_sp02;
                             if (osMessageQueuePut(g_app_cb.app_msg, &app_msg, 0U, CONFIG_QUEUE_TIMEOUT) != 0) {
                             free(app_msg);
                             }
                             osDelay(30U);
-                        }
 
                     }
-                    g_app_cb.flag_timer_2 = 0;
+                    g_app_cb.flag_timer_1 = 0;
                     g_app_cb.max30102_state = 0;
                     status_1 = osTimerStop(id1);
                     i=0;
                     j=0;
                     break;
-                }
                 
                 if (g_app_cb.max30102_state == 0)
                 {
@@ -810,6 +869,12 @@ static void IotMainTaskEntry(void)
     if (osThreadNew((osThreadFunc_t)Max30102TaskEntry, NULL, &attr) == NULL) {
         printf("Failed to create Max30102TaskEntry!\n");
     }
-    
+
+    attr.stack_size = SENSOR_TASK_STACK_SIZE;
+    attr.priority = 26;
+    attr.name = "heartrateTask_Init";
+    if (osThreadNew((osThreadFunc_t)heartrateTask_Init, NULL, &attr) == NULL) {
+        printf("Failed to create heartrateTask_Init!\n");
+    }
 }
 APP_FEATURE_INIT(IotMainTaskEntry);

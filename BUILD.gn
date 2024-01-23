@@ -23,6 +23,7 @@ static_library("cloud_oc_manhole_cover") {
     "src/E53_SC2.c",
     "src/wifi_connect.c",
     "max30102/max30102.c",
+    "max30102/algorithm.c",
     #"src/oc_mqtt.c",
     #"src/oc_mqtt_profile_package.c",
   ]
@@ -41,6 +42,7 @@ static_library("cloud_oc_manhole_cover") {
     "//kernel/liteos_m/components/cmsis/2.0",
     "//applications/sample/wifi-iot/app/max30102_demo",
     "max30102",
+    "//device/hisilicon/hispark_pegasus/sdk_liteos/third_party/lwip_sack/include/lwip",
     "//device/hisilicon/hispark_pegasus/sdk_liteos/platform/os/Huawei_LiteOS/components/lib/libc/musl/include",
 
     #"//vendor/bearpi/bearpi_hm_nano/common/third_party/paho_mqtt/MQTTClient-C/src",
